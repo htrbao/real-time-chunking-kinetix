@@ -33,6 +33,14 @@ class RealtimeMethodConfig:
 
 
 @dataclasses.dataclass(frozen=True)
+class TEMethodConfig:
+    k: float = -0.015
+    num_queries = 16
+    ensemble_weights = jnp.exp(k * jnp.arange(num_queries))
+    ensemble_weights_cumsum = jnp.cumsum(ensemble_weights, axis=0)
+
+
+@dataclasses.dataclass(frozen=True)
 class BIDMethodConfig:
     n_samples: int = 16
     bid_k: int | None = None
@@ -47,7 +55,7 @@ class EvalConfig:
 
     inference_delay: int = 0
     execute_horizon: int = 1
-    method: NaiveMethodConfig | RealtimeMethodConfig | BIDMethodConfig = NaiveMethodConfig()
+    method: NaiveMethodConfig | RealtimeMethodConfig | TEMethodConfig | BIDMethodConfig = NaiveMethodConfig()
 
     model: _model.ModelConfig = _model.ModelConfig()
 
@@ -113,6 +121,8 @@ def eval(
                 bid_k=config.method.bid_k,
                 bid_weak_policy=weak_policy if config.method.bid_k is not None else None,
             )
+        elif isinstance(config.method, TEMethodConfig):
+            next_action_chunk = policy.te_action(key, obs, config.num_flow_steps, config.method.num_queries, config.method.ensemble_weights, config.method.ensemble_weights_cumsum)
         else:
             raise ValueError(f"Unknown method: {config.method}")
 
@@ -250,6 +260,19 @@ def main(
     for inference_delay in [0, 1, 2, 3, 4]:
         for execute_horizon in range(max(1, inference_delay), 8 - inference_delay + 1):
             print(f"{inference_delay=} {execute_horizon=}")
+            if inference_delay == 0 and execute_horizon == 1:
+                c = dataclasses.replace(
+                    config, inference_delay=inference_delay, execute_horizon=execute_horizon, method=TEMethodConfig()
+                )
+                out = jax.device_get(_eval(c, rngs, levels, state_dicts, weak_state_dicts))
+                for i in range(len(level_paths)):
+                    for k, v in out.items():
+                        results[k].append(v[i])
+                    results["delay"].append(inference_delay)
+                    results["method"].append("te")
+                    results["level"].append(level_paths[i])
+                    results["execute_horizon"].append(execute_horizon)
+                    
             c = dataclasses.replace(
                 config, inference_delay=inference_delay, execute_horizon=execute_horizon, method=NaiveMethodConfig()
             )
