@@ -113,6 +113,8 @@ class FlowPolicy(nnx.Module):
         self.action_dim = action_dim
         self.action_chunk_size = config.action_chunk_size
         self.simulated_delay = config.simulated_delay
+        self.ensembled_actions = None
+        self.ensembled_actions_count = None
 
         self.in_proj = nnx.Linear(action_dim + obs_dim, config.channel_dim, rngs=rngs)
         self.mlp_stack = [
@@ -136,6 +138,10 @@ class FlowPolicy(nnx.Module):
             config.channel_dim, 2 * config.channel_dim, kernel_init=nnx.initializers.zeros_init(), rngs=rngs
         )
         self.out_proj = nnx.Linear(config.channel_dim, action_dim, rngs=rngs)
+
+    def reset(self):
+        self.ensembled_actions = None
+        self.ensembled_actions_count = None
 
     def __call__(self, obs: jax.Array, x_t: jax.Array, time: jax.Array) -> jax.Array:
         assert x_t.shape == (obs.shape[0], self.action_chunk_size, self.action_dim), x_t.shape
@@ -262,6 +268,64 @@ class FlowPolicy(nnx.Module):
         noise = jax.random.normal(rng, shape=(obs.shape[0], self.action_chunk_size, self.action_dim))
         (x_1, _), _ = jax.lax.scan(step, (noise, 0.0), length=num_steps)
         assert x_1.shape == (obs.shape[0], self.action_chunk_size, self.action_dim), x_1.shape
+        return x_1
+
+    def te_action(
+        self,
+        rng: jax.Array,
+        obs: jax.Array,
+        num_steps: int,
+        num_queries: int,
+        ensemble_weights: jax.Array,
+        ensemble_weights_cumsum: jax.Array
+    ) -> jax.Array:
+
+        print("TE inference num_queries:", num_queries)
+        x_1 = self.action(rng, obs, num_steps)
+
+        B, _, action_dim = x_1.shape
+
+        if self.ensembled_actions is None:
+            # Initialize ensemble
+            self.ensembled_actions = x_1
+            self.ensembled_actions_count = jnp.ones(
+                (num_queries, 1), dtype=jnp.int32
+            )
+
+        else:
+            # === online update for first (num_queries - 1) entries ===
+            counts = self.ensembled_actions_count  # (num_queries - 1, 1)
+
+            # gather weights exactly like torch
+            w_prev = ensemble_weights_cumsum[counts - 1]  # (num_queries - 1, 1)
+            w_new  = ensemble_weights[counts]              # (num_queries - 1, 1)
+            w_sum  = ensemble_weights_cumsum[counts]       # (num_queries - 1, 1)
+
+            updated = self.ensembled_actions[:, :-1, :] * w_prev
+            updated = updated + x_1[:, :-1, :] * w_new
+            updated = updated / w_sum
+
+            # update counts
+            new_counts = jnp.clip(counts + 1, a_max=num_queries)
+
+            # append last action (no averaging)
+            self.ensembled_actions = jnp.concatenate(
+                [updated, x_1[:, -1:, :]], axis=1
+            )
+
+            self.ensembled_actions_count = jnp.concatenate(
+                [
+                    new_counts,
+                    jnp.ones((1, 1), dtype=counts.dtype)
+                ],
+                axis=0
+            )
+
+        # === consume first action ===
+        x_1 = self.ensembled_actions.copy()
+        self.ensembled_actions = self.ensembled_actions[:, 1:, :]
+        self.ensembled_actions_count = self.ensembled_actions_count[1:]
+
         return x_1
 
     def loss(self, rng: jax.Array, obs: jax.Array, action: jax.Array):
