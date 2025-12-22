@@ -35,7 +35,7 @@ class RealtimeMethodConfig:
 @dataclasses.dataclass(frozen=True)
 class TEMethodConfig:
     k: float = -0.015
-    num_queries = 16
+    num_queries = 8
     ensemble_weights = jnp.exp(k * jnp.arange(num_queries))
     ensemble_weights_cumsum = jnp.cumsum(ensemble_weights, axis=0)
 
@@ -182,18 +182,18 @@ def main(
     run_path: str,
     config: EvalConfig = EvalConfig(),
     level_paths: Sequence[str] = (
-        "worlds/l/grasp_easy.json",
-        "worlds/l/catapult.json",
-        "worlds/l/cartpole_thrust.json",
+        # "worlds/l/grasp_easy.json",
+        # "worlds/l/catapult.json",
+        # "worlds/l/cartpole_thrust.json",
         "worlds/l/hard_lunar_lander.json",
         "worlds/l/mjc_half_cheetah.json",
-        "worlds/l/mjc_swimmer.json",
-        "worlds/l/mjc_walker.json",
+        # "worlds/l/mjc_swimmer.json",
+        # "worlds/l/mjc_walker.json",
         "worlds/l/h17_unicycle.json",
-        "worlds/l/chain_lander.json",
-        "worlds/l/catcher_v3.json",
-        "worlds/l/trampoline.json",
-        "worlds/l/car_launch.json",
+        # "worlds/l/chain_lander.json",
+        # "worlds/l/catcher_v3.json",
+        # "worlds/l/trampoline.json",
+        # "worlds/l/car_launch.json",
     ),
     seed: int = 0,
     output_dir: str | None = "eval_output",
@@ -297,17 +297,17 @@ def main(
                 results["level"].append(level_paths[i])
                 results["execute_horizon"].append(execute_horizon)
 
-            c = dataclasses.replace(
-                config, inference_delay=inference_delay, execute_horizon=execute_horizon, method=BIDMethodConfig()
-            )
-            out = jax.device_get(_eval(c, rngs, levels, state_dicts, weak_state_dicts))
-            for i in range(len(level_paths)):
-                for k, v in out.items():
-                    results[k].append(v[i])
-                results["delay"].append(inference_delay)
-                results["method"].append("bid")
-                results["level"].append(level_paths[i])
-                results["execute_horizon"].append(execute_horizon)
+            # c = dataclasses.replace(
+            #     config, inference_delay=inference_delay, execute_horizon=execute_horizon, method=BIDMethodConfig()
+            # )
+            # out = jax.device_get(_eval(c, rngs, levels, state_dicts, weak_state_dicts))
+            # for i in range(len(level_paths)):
+            #     for k, v in out.items():
+            #         results[k].append(v[i])
+            #     results["delay"].append(inference_delay)
+            #     results["method"].append("bid")
+            #     results["level"].append(level_paths[i])
+            #     results["execute_horizon"].append(execute_horizon)
 
             c = dataclasses.replace(
                 config,

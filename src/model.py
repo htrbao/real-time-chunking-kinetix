@@ -351,3 +351,67 @@ class FlowPolicy(nnx.Module):
         loss = jnp.square(pred - u_t)
         loss_mask = jnp.logical_not(mask)[:, :, None]
         return jnp.sum(loss * loss_mask) / (jnp.sum(loss_mask) + 1e-8)
+    
+    def call_shared_observation(self, obs: jax.Array, x_t: jax.Array, time: jax.Array) -> jax.Array:
+        assert x_t.shape == (obs.shape[0], self.action_chunk_size, self.action_dim), x_t.shape
+        if time.ndim == 1:
+            time = time[:, None]
+        time = jnp.broadcast_to(time, (obs.shape[0], self.action_chunk_size))
+        time_emb = jax.vmap(
+            functools.partial(posemb_sincos, embedding_dim=self.channel_dim, min_period=4e-3, max_period=4.0)
+        )(time)
+        time_emb = self.time_mlp(time_emb)
+        obs = einops.repeat(obs, "b e -> b c e", c=self.action_chunk_size)
+        x = jnp.concatenate([x_t, obs], axis=-1)
+        x = self.in_proj(x)
+        for mlp in self.mlp_stack:
+            x = mlp(x, time_emb)
+        assert x.shape == (obs.shape[0], self.action_chunk_size, self.channel_dim), x.shape
+        scale, shift = jnp.split(self.final_adaln(time_emb), 2, axis=-1)
+        x = self.final_norm(x) * (1 + scale) + shift
+        x = self.out_proj(x)
+        return x
+
+    def forward_shared_observation(
+        self,
+        rng: jax.Array,
+        obs: jax.Array,                # [B, N, state_dim]
+        actions: jax.Array,            # [B, H, action_dim]
+        offset_mask: jax.Array,        # [B, N] (bool)
+        noise: jax.Array | None = None,
+        time: jax.Array | None = None,
+    ):
+        """
+        Shared-observation training forward pass.
+        """
+        assert actions.dtype == jnp.float32
+        assert actions.shape == (obs.shape[0], self.action_chunk_size, self.action_dim), actions.shape
+        noise_rng, time_rng, delay_rng = jax.random.split(rng, 3)
+
+        batch_size, offset, _ = obs.shape[0], obs.shape[1], obs.shape[2]
+        if noise is None:
+            noise = jax.random.normal(rng, actions.shape)
+
+        if time is None:
+            rng, time_rng = jax.random.split(rng)
+            time = jax.random.uniform(time_rng, (batch_size, offset_mask))
+
+        time_exp = time[:, :, None, None]          # [B, N, 1, 1]
+        u_t = noise - actions                      # true velocity
+
+        x_t = (1 - time[:, :, None]) * noise + time[:, :, None] * actions
+
+        # Flatten offsets (like suffix_flat)
+        states_flat = obs.reshape(batch_size * offset, -1)
+        x_t_flat = x_t[:, :offset, :].reshape(batch_size * offset, -1)
+
+        shared_obs_emb = self.in_proj(jnp.concatenate([x_t_flat, states_flat], axis=-1)) # [B * N, C] 
+        shared_obs_emb = einops.repeat(shared_obs_emb, " (b n) c -> b (n c) ", b=batch_size, n=offset)
+
+        pred = self.call_shared_observation(states_flat, x_t_flat, time_exp)
+
+        # -------------------------
+        # Mask invalid offsets
+        # -------------------------
+
+        return jnp.mean(jnp.square(pred - u_t))
