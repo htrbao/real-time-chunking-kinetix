@@ -327,6 +327,16 @@ class FlowPolicy(nnx.Module):
         self.ensembled_actions_count = self.ensembled_actions_count[1:]
 
         return x_1
+    
+    def vlash_action(
+        self,
+        rng: jax.Array,
+        obs: jax.Array,
+        num_steps: int,
+        states: jax.Array,  # [batch, action_dim]
+    ) -> jax.Array:
+        obs = jnp.concatenate([obs, states], axis=-1)
+        return self.action(rng, obs, num_steps)
 
     def loss(self, rng: jax.Array, obs: jax.Array, action: jax.Array):
         assert action.dtype == jnp.float32
@@ -351,26 +361,6 @@ class FlowPolicy(nnx.Module):
         loss = jnp.square(pred - u_t)
         loss_mask = jnp.logical_not(mask)[:, :, None]
         return jnp.sum(loss * loss_mask) / (jnp.sum(loss_mask) + 1e-8)
-    
-    def call_shared_observation(self, obs: jax.Array, x_t: jax.Array, time: jax.Array) -> jax.Array:
-        assert x_t.shape == (obs.shape[0], self.action_chunk_size, self.action_dim), x_t.shape
-        if time.ndim == 1:
-            time = time[:, None]
-        time = jnp.broadcast_to(time, (obs.shape[0], self.action_chunk_size))
-        time_emb = jax.vmap(
-            functools.partial(posemb_sincos, embedding_dim=self.channel_dim, min_period=4e-3, max_period=4.0)
-        )(time)
-        time_emb = self.time_mlp(time_emb)
-        obs = einops.repeat(obs, "b e -> b c e", c=self.action_chunk_size)
-        x = jnp.concatenate([x_t, obs], axis=-1)
-        x = self.in_proj(x)
-        for mlp in self.mlp_stack:
-            x = mlp(x, time_emb)
-        assert x.shape == (obs.shape[0], self.action_chunk_size, self.channel_dim), x.shape
-        scale, shift = jnp.split(self.final_adaln(time_emb), 2, axis=-1)
-        x = self.final_norm(x) * (1 + scale) + shift
-        x = self.out_proj(x)
-        return x
 
     def forward_shared_observation(
         self,
