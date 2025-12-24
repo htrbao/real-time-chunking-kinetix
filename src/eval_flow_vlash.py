@@ -60,7 +60,7 @@ class EvalConfig:
 
     inference_delay: int = 0
     execute_horizon: int = 1
-    method: NaiveMethodConfig | RealtimeMethodConfig | TEMethodConfig | BIDMethodConfig = NaiveMethodConfig()
+    method: NaiveMethodConfig | RealtimeMethodConfig | VLASHMethodConfig | TEMethodConfig | BIDMethodConfig = VLASHMethodConfig()
 
     model: _model.ModelConfig = _model.ModelConfig()
 
