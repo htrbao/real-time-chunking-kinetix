@@ -100,12 +100,17 @@ def eval(
         else:
             raise ValueError(f"Unknown method: {config.method}")
 
+
+        # next state is at config.execute_horizon because 
+        # `config.execute_horizon - config.inference_delay` of next action chunk is used for this action chunk and
+        # `config.inference_delay` is used for the next action chunk prefix
+        next_state = next_action_chunk[:, config.execute_horizon - 1, :]
         # we execute `inference_delay` actions from the *previously generated* action chunk, and then the remaining
         # `execute_horizon - inference_delay` actions from the newly generated action chunk
         action_chunk_to_execute = jnp.concatenate(
             [
                 action_chunk[:, : config.inference_delay],
-                next_action_chunk[:, config.inference_delay : config.execute_horizon],
+                next_action_chunk[:, : config.execute_horizon - config.inference_delay],
             ],
             axis=1,
         )
@@ -113,12 +118,11 @@ def eval(
         # correct frame of reference for the next scan iteration
         next_action_chunk = jnp.concatenate(
             [
-                next_action_chunk[:, config.execute_horizon :],
-                jnp.zeros((obs.shape[0], config.execute_horizon, policy.action_dim)),
+                next_action_chunk[:, config.execute_horizon - config.inference_delay :],
+                jnp.zeros((obs.shape[0], config.execute_horizon - config.inference_delay, policy.action_dim)),
             ],
             axis=1,
         )
-        next_state = action_chunk[:, config.execute_horizon - config.inference_delay - 1, :]
         next_n = jnp.concatenate([n[config.execute_horizon :], jnp.zeros(config.execute_horizon, dtype=jnp.int32)])
         (rng, next_obs, next_env_state), (dones, env_states, infos) = jax.lax.scan(
             step, (rng, obs, env_state), action_chunk_to_execute.transpose(1, 0, 2)
@@ -130,7 +134,7 @@ def eval(
     rng, key = jax.random.split(rng)
     obs, env_state = env.reset_to_level(key, level, env_params)
     rng, key = jax.random.split(rng)
-    state = jnp.zeros([obs.shape[0], env.action_space(env_params).shape[0]])
+    state = jnp.zeros([obs.shape[0], policy.action_dim])
     action_chunk = policy.action(key, jnp.concatenate([obs, state], axis=-1), config.num_flow_steps)  # [batch, horizon, action_dim]
     n = jnp.ones(action_chunk.shape[1], dtype=jnp.int32)
     scan_length = math.ceil(env_params.max_timesteps / config.execute_horizon)
