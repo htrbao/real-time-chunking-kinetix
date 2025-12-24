@@ -24,7 +24,7 @@ import generate_data
 import model as _model
 import train_expert
 
-WANDB_PROJECT = "t"
+WANDB_PROJECT = "rtc-kinetix-bc"
 LOG_DIR = pathlib.Path("logs-bc")
 
 
