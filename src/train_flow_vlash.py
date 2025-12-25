@@ -198,7 +198,7 @@ def main(config: Config):
 
                 prev_batch_idxs = jnp.maximum(
                     jnp.minimum(
-                        batch_idxs[:, None] + batch_offsets,
+                        batch_idxs[:, None] + batch_offsets - 1,
                         (episodes_end - 1)[:, None]
                     ),
                     episodes_start[:, None]

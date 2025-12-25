@@ -368,8 +368,6 @@ class FlowPolicy(nnx.Module):
         obs: jax.Array,                # [B, state_dim]
         states: jax.Array,             # [B, N, state_dim]
         actions: jax.Array,            # [B, N, H, action_dim]
-        noise: jax.Array | None = None,
-        time: jax.Array | None = None,
     ):
         """
         Shared-observation training forward pass.
@@ -377,19 +375,14 @@ class FlowPolicy(nnx.Module):
         assert actions.dtype == jnp.float32
         assert actions.shape == (obs.shape[0], states.shape[1], self.action_chunk_size, self.action_dim), actions.shape
         noise_rng, time_rng, delay_rng = jax.random.split(rng, 3)
-
         batch_size, offset, _ = states.shape
-        if noise is None:
-            noise = jax.random.normal(rng, actions.shape)
-
-        if time is None:
-            rng, time_rng = jax.random.split(rng)
-            time = jax.random.uniform(time_rng, (batch_size, offset))
+        time = jax.random.uniform(time_rng, (batch_size, offset))
+        noise = jax.random.normal(noise_rng, shape=actions.shape)
+        u_t = actions - noise
 
         time_exp = time[:, :, None, None]          # [B, N, 1, 1]
-        u_t = noise - actions                      # true velocity
 
-        x_t = time_exp * noise + (1 - time_exp) * actions
+        x_t = (1 - time_exp) * noise + time_exp * actions
 
         # Flatten offsets (like suffix_flat)
         obs = einops.repeat(obs, "b e -> b n e", n=offset).reshape(batch_size * offset, -1)
@@ -399,6 +392,6 @@ class FlowPolicy(nnx.Module):
 
         pred = self(jnp.concatenate([obs, states_flat], axis=-1), x_t_flat, time_flat)
 
-        pred = pred.reshape(batch_size, offset, self.action_chunk_size, -1)
+        pred = einops.rearrange(pred, "(b n) c e -> b n c e", b=batch_size)
 
         return jnp.mean(jnp.square(pred - u_t))
