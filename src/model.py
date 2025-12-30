@@ -8,6 +8,71 @@ import jax
 import jax.numpy as jnp
 
 
+# VLASH dynamics order: which derivatives to include as conditioning
+# "position" = action only
+# "velocity" = action + velocity (first difference)
+# "acceleration" = action + velocity + acceleration (second difference)
+VLASHOrder: TypeAlias = Literal["position", "velocity", "acceleration"]
+
+
+def compute_vlash_state(actions: jax.Array, order: VLASHOrder) -> jax.Array:
+    """
+    Compute VLASH state from action history for dynamics consistency.
+    
+    Args:
+        actions: Array of shape [..., num_history, action_dim] containing action history
+                 where actions[..., 0, :] is the oldest and actions[..., -1, :] is the most recent
+        order: Which dynamics order to use
+        
+    Returns:
+        state: Concatenated state vector including position and optionally velocity/acceleration
+    """
+    if order == "position":
+        # Just use the most recent action as position
+        return actions[..., -1, :]
+    
+    elif order == "velocity":
+        # Position (most recent action) + velocity (difference between last two)
+        position = actions[..., -1, :]
+        velocity = actions[..., -1, :] - actions[..., -2, :]
+        return jnp.concatenate([position, velocity], axis=-1)
+    
+    elif order == "acceleration":
+        # Position + velocity + acceleration
+        position = actions[..., -1, :]
+        velocity = actions[..., -1, :] - actions[..., -2, :]
+        prev_velocity = actions[..., -2, :] - actions[..., -3, :]
+        acceleration = velocity - prev_velocity
+        return jnp.concatenate([position, velocity, acceleration], axis=-1)
+    
+    else:
+        raise ValueError(f"Unknown VLASH order: {order}")
+
+
+def get_vlash_state_dim(action_dim: int, order: VLASHOrder) -> int:
+    """Get the dimension of the VLASH state vector."""
+    if order == "position":
+        return action_dim
+    elif order == "velocity":
+        return 2 * action_dim
+    elif order == "acceleration":
+        return 3 * action_dim
+    else:
+        raise ValueError(f"Unknown VLASH order: {order}")
+
+
+def get_vlash_history_size(order: VLASHOrder) -> int:
+    """Get the required action history size for the given order."""
+    if order == "position":
+        return 1
+    elif order == "velocity":
+        return 2
+    elif order == "acceleration":
+        return 3
+    else:
+        raise ValueError(f"Unknown VLASH order: {order}")
+
+
 @dataclasses.dataclass(frozen=True)
 class ModelConfig:
     channel_dim: int = 256
@@ -16,6 +81,7 @@ class ModelConfig:
     num_layers: int = 4
     action_chunk_size: int = 8
     simulated_delay: int | None = None
+    vlash_order: VLASHOrder = "position"
 
 
 def posemb_sincos(pos: jax.Array, embedding_dim: int, min_period: float, max_period: float) -> jax.Array:
@@ -113,6 +179,7 @@ class FlowPolicy(nnx.Module):
         self.action_dim = action_dim
         self.action_chunk_size = config.action_chunk_size
         self.simulated_delay = config.simulated_delay
+        self.vlash_order = config.vlash_order
         self.ensembled_actions = None
         self.ensembled_actions_count = None
 
@@ -333,9 +400,24 @@ class FlowPolicy(nnx.Module):
         rng: jax.Array,
         obs: jax.Array,
         num_steps: int,
-        states: jax.Array,  # [batch, action_dim]
+        action_history: jax.Array,  # [batch, history_size, action_dim] for full-order dynamics
     ) -> jax.Array:
-        obs = jnp.concatenate([obs, states], axis=-1)
+        """
+        Generate action chunk with VLASH conditioning.
+        
+        Args:
+            rng: Random key
+            obs: Observation [batch, obs_dim]
+            num_steps: Number of flow steps
+            action_history: Action history [batch, history_size, action_dim]
+                           history_size should be >= get_vlash_history_size(self.vlash_order)
+                           
+        Returns:
+            action_chunk: [batch, action_chunk_size, action_dim]
+        """
+        # Compute state from action history based on dynamics order
+        state = compute_vlash_state(action_history, self.vlash_order)
+        obs = jnp.concatenate([obs, state], axis=-1)
         return self.action(rng, obs, num_steps)
 
     def loss(self, rng: jax.Array, obs: jax.Array, action: jax.Array):
@@ -365,15 +447,30 @@ class FlowPolicy(nnx.Module):
     def forward_shared_observation(
         self,
         rng: jax.Array,
-        obs: jax.Array,                # [B, state_dim]
-        states: jax.Array,             # [B, N, state_dim]
+        obs: jax.Array,                # [B, N, obs_dim] - observation for each offset
+        states: jax.Array,             # [B, N, vlash_state_dim] - computed from action history
         actions: jax.Array,            # [B, N, H, action_dim]
     ):
         """
-        Shared-observation training forward pass.
+        Shared-observation training forward pass for VLASH.
+        
+        For each sample in the batch, we have N different simulated delay offsets.
+        Each offset corresponds to a different observation point where we compute the
+        VLASH state from action history and predict action chunks.
+        
+        Args:
+            rng: Random key
+            obs: Observations for each offset [B, N, obs_dim]
+            states: VLASH states for each offset, computed from action history [B, N, vlash_state_dim]
+                    vlash_state_dim depends on vlash_order:
+                    - "position": action_dim
+                    - "velocity": 2 * action_dim  
+                    - "acceleration": 3 * action_dim
+            actions: Target action chunks for each offset [B, N, H, action_dim]
         """
         assert actions.dtype == jnp.float32
         assert actions.shape == (obs.shape[0], states.shape[1], self.action_chunk_size, self.action_dim), actions.shape
+        assert obs.shape[:2] == states.shape[:2], f"{obs.shape=} {states.shape=}"
         noise_rng, time_rng, delay_rng = jax.random.split(rng, 3)
         batch_size, offset, _ = states.shape
         time = jax.random.uniform(time_rng, (batch_size, offset))
@@ -384,13 +481,13 @@ class FlowPolicy(nnx.Module):
 
         x_t = (1 - time_exp) * noise + time_exp * actions
 
-        # Flatten offsets (like suffix_flat)
-        obs = einops.repeat(obs, "b e -> b n e", n=offset).reshape(batch_size * offset, -1)
+        # Flatten offsets
+        obs_flat = obs.reshape(batch_size * offset, -1)
         states_flat = states.reshape(batch_size * offset, -1)
         x_t_flat = x_t.reshape(batch_size * offset, self.action_chunk_size, -1)
         time_flat = time.reshape(batch_size * offset, -1)
 
-        pred = self(jnp.concatenate([obs, states_flat], axis=-1), x_t_flat, time_flat)
+        pred = self(jnp.concatenate([obs_flat, states_flat], axis=-1), x_t_flat, time_flat)
 
         pred = einops.rearrange(pred, "(b n) c e -> b n c e", b=batch_size)
 

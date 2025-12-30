@@ -22,6 +22,7 @@ import wandb
 import eval_flow_vlash as _eval
 import generate_data
 import model as _model
+from model import get_vlash_history_size, compute_vlash_state, get_vlash_state_dim
 import train_expert
 
 WANDB_PROJECT = "rtc-kinetix-bc"
@@ -115,6 +116,7 @@ def main(config: Config):
 
     obs_dim = data.obs.shape[-1]
     action_dim = env.action_space(env_params).shape[0]
+    vlash_state_dim = get_vlash_state_dim(action_dim, config.eval.model.vlash_order)
 
     # VLASH
     max_delta = action_chunk_size - 1
@@ -140,7 +142,7 @@ def main(config: Config):
     def init(rng: jax.Array, state_dict: dict | None) -> EpochCarry:
         rng, key = jax.random.split(rng)
         policy = _model.FlowPolicy(
-            obs_dim=obs_dim + action_dim,
+            obs_dim=obs_dim + vlash_state_dim,
             action_dim=action_dim,
             config=config.eval.model,
             rngs=nnx.Rngs(key),
@@ -174,10 +176,20 @@ def main(config: Config):
             rng, key = jax.random.split(rng)
 
             def loss_fn(policy: _model.FlowPolicy):
-                # VLASH
+                # VLASH with full-order dynamics support
+                # For each sample in batch, we compute states at multiple delay offsets
+                
+                # simulated_delay must be set for VLASH training
+                assert policy.simulated_delay is not None, \
+                    "simulated_delay must be set in ModelConfig for VLASH training"
+                
+                vlash_history = get_vlash_history_size(policy.vlash_order)
+                
                 episodes = meta_episode_ids[batch_idxs]     # (B,)
                 episodes_start = episode_from_ids[episodes] # (B,)
                 episodes_end = episode_to_ids[episodes]     # (B,)
+                
+                # Compute valid offsets (how many delays we can apply)
                 max_offsets = jnp.minimum(
                     jnp.maximum(
                         episodes_end - 1 - (batch_idxs + max_delta),
@@ -186,64 +198,86 @@ def main(config: Config):
                     policy.simulated_delay
                 ) # (B,)
                 num_offsets = max_offsets + 1 # (B,)
-
-                offsets = jnp.arange(1, policy.simulated_delay) # (Moff-1,)
-                batch_offsets = jnp.broadcast_to(offsets, (config.batch_size, policy.simulated_delay - 1)) # (B, Moff-1)
-
-                # TODO: double-check this logic with Bao
-                # if offset == 0:
-                #    state = base_item["observation.state"]
-                obs_states = data.action[batch_idxs[:, None]] # (B, 1, state_dim)
-                obs_states = jnp.where((batch_idxs == 0)[:, None, None], 0, obs_states)
-
-                prev_batch_idxs = jnp.maximum(
-                    jnp.minimum(
-                        batch_idxs[:, None] + batch_offsets - 1,
-                        (episodes_end - 1)[:, None]
-                    ),
-                    episodes_start[:, None]
-                ) # (B, Moff-1)
-                prev_actions = data.action[prev_batch_idxs] # (B, Moff-1, state_dim)
-                prev_actions = jnp.where(
-                    batch_offsets[:, :, None] < num_offsets[:, None, None],
-                    prev_actions,
-                    0
-                ) # (B, Moff-1, state_dim)
-                states = jnp.concatenate([obs_states, prev_actions], axis=1) # (B, Moff, state_dim)
-
-                batch_offsets = jnp.concatenate([
-                    jnp.zeros((config.batch_size, 1), dtype=int),
-                    batch_offsets
-                ], axis=-1) # (B, Moff)
+                
+                # Create offset indices: [0, 1, ..., simulated_delay-1]
+                offsets = jnp.arange(policy.simulated_delay) # (Moff,)
+                batch_offsets = jnp.broadcast_to(offsets, (config.batch_size, policy.simulated_delay)) # (B, Moff)
+                
+                # Compute VLASH states for each offset
+                # For offset k at batch_idx i, the observation point is at i + k
+                # The state should be computed from actions BEFORE that observation point
+                # 
+                # For position order: state = action[obs_point - 1]
+                # For velocity order: state = [action[obs_point - 1], action[obs_point - 1] - action[obs_point - 2]]
+                # For acceleration: + second derivative
+                
+                # Indices for gathering action history for state computation
+                # Shape: (B, Moff, vlash_history)
+                # For each (batch, offset), we need vlash_history consecutive previous actions
+                obs_points = batch_idxs[:, None] + batch_offsets  # (B, Moff) - observation point indices
+                
+                # Action history indices: for state at obs_point, we need actions at
+                # obs_point - vlash_history, obs_point - vlash_history + 1, ..., obs_point - 1
+                history_offsets = jnp.arange(-vlash_history, 0)  # (-H, ..., -1)
+                action_history_idxs = obs_points[:, :, None] + history_offsets[None, None, :]  # (B, Moff, H)
+                
+                # Clamp to episode boundaries
+                action_history_idxs = jnp.maximum(
+                    jnp.minimum(action_history_idxs, (episodes_end - 1)[:, None, None]),
+                    episodes_start[:, None, None]
+                )  # (B, Moff, H)
+                
+                # Gather action history
+                action_history = data.action[action_history_idxs]  # (B, Moff, H, action_dim)
+                
+                # Zero out actions for invalid offsets and handle episode start
+                is_valid_offset = batch_offsets < num_offsets[:, None]  # (B, Moff)
+                is_at_episode_start = obs_points <= episodes_start[:, None]  # (B, Moff)
+                
+                action_history = jnp.where(
+                    (is_valid_offset & ~is_at_episode_start)[:, :, None, None],
+                    action_history,
+                    0.0
+                )  # (B, Moff, H, action_dim)
+                
+                # Compute VLASH states from action history
+                states = jax.vmap(jax.vmap(
+                    lambda ah: compute_vlash_state(ah, policy.vlash_order)
+                ))(action_history)  # (B, Moff, state_dim)
+                
+                # Compute action chunk indices for each offset
+                # For offset k, the chunk starts at batch_idx + k
+                chunk_start_idxs = batch_idxs[:, None] + batch_offsets  # (B, Moff)
                 chunk_batch_idxs = jnp.maximum(
                     jnp.minimum(
-                        batch_idxs[:, None, None] + batch_offsets[:, :, None] + jnp.arange(action_chunk_size)[None, None, :],
+                        chunk_start_idxs[:, :, None] + jnp.arange(action_chunk_size)[None, None, :],
                         (episodes_end - 1)[:, None, None]
                     ),
                     episodes_start[:, None, None]
-                ) # (B, Moff, chunk_size)
+                )  # (B, Moff, chunk_size)
+                
+                action_chunks = data.action[chunk_batch_idxs]  # (B, Moff, chunk_size, action_dim)
+                
+                # Zero out invalid offsets
                 action_chunks = jnp.where(
-                    batch_offsets[:, :, None, None] < num_offsets[:, None, None, None],
-                    data.action[chunk_batch_idxs],
-                    0
-                ) # (B, Moff, chunk_size, action_dim)
-
-                obs = data.obs[batch_idxs]
-
-                # action_chunks = data.action[batch_idxs[:, None] + jnp.arange(action_chunk_size)[None, :]]
-                # # zero actions after done
-                # done_chunks = data.done[batch_idxs[:, None] + jnp.arange(action_chunk_size)[None, :]]
-                # done_idxs = jnp.where(
-                #     jnp.any(done_chunks, axis=-1),
-                #     jnp.argmax(done_chunks, axis=-1),
-                #     action_chunk_size,
-                # )
-                # action_chunks = jnp.where(
-                #     jnp.arange(action_chunk_size)[None, :, None] >= done_idxs[:, None, None],
-                #     0.0,
-                #     action_chunks,
-                # )
-                return policy.forward_shared_observation(key, obs, states, action_chunks)
+                    is_valid_offset[:, :, None, None],
+                    action_chunks,
+                    0.0
+                )  # (B, Moff, chunk_size, action_dim)
+                
+                # Get observations for each offset point (not just base observation)
+                obs_points = batch_idxs[:, None] + batch_offsets  # (B, Moff)
+                obs_points = jnp.minimum(obs_points, episodes_end[:, None] - 1)  # Clamp to episode end
+                obs_all = data.obs[obs_points]  # (B, Moff, obs_dim)
+                
+                # Zero out invalid offset observations
+                obs_all = jnp.where(
+                    is_valid_offset[:, :, None],
+                    obs_all,
+                    0.0
+                )  # (B, Moff, obs_dim)
+                
+                return policy.forward_shared_observation(key, obs_all, states, action_chunks)
 
             loss, grads = nnx.value_and_grad(loss_fn)(policy)
             info = {"loss": loss, "grad_norm": optax.global_norm(grads)}

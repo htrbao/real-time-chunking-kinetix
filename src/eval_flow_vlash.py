@@ -18,6 +18,7 @@ import pandas as pd
 import tyro
 
 import model as _model
+from model import get_vlash_history_size, get_vlash_state_dim
 import train_expert
 
 
@@ -80,33 +81,47 @@ def eval(
     )
     render_video = train_expert.make_render_video(renderer_pixels.make_render_pixels(env_params, static_env_params))
     assert config.execute_horizon >= config.inference_delay, f"{config.execute_horizon=} {config.inference_delay=}"
+    
+    # Get the required action history size for the VLASH order
+    vlash_history_size = get_vlash_history_size(policy.vlash_order)
 
     def execute_chunk(carry, _):
         def step(carry, action):
-            rng, obs, env_state = carry
+            rng, obs, env_state, action_history = carry
             rng, key = jax.random.split(rng)
             next_obs, next_env_state, reward, done, info = env.step(key, env_state, action, env_params)
-            return (rng, next_obs, next_env_state), (done, env_state, info)
+            # Update action history: shift left and append new action
+            next_action_history = jnp.concatenate([
+                action_history[:, 1:, :],
+                action[:, None, :]
+            ], axis=1)
+            return (rng, next_obs, next_env_state, next_action_history), (done, env_state, info)
 
-        rng, obs, state, env_state, action_chunk, n = carry
+        rng, obs, action_history, env_state, action_chunk, n = carry
         rng, key = jax.random.split(rng)        
         if isinstance(config.method, VLASHMethodConfig):
             next_action_chunk = policy.vlash_action(
                 key,
                 obs,
                 config.num_flow_steps,
-                state,
+                action_history,  # Pass full action history for dynamics computation
             )
         else:
             raise ValueError(f"Unknown method: {config.method}")
 
-
-        # next state is at config.execute_horizon because 
-        # `config.execute_horizon - config.inference_delay` of next action chunk is used for this action chunk and
-        # `config.inference_delay` is used for the next action chunk prefix
-        next_state = next_action_chunk[:, config.execute_horizon - 1, :]
-        # we execute `inference_delay` actions from the *previously generated* action chunk, and then the remaining
-        # `execute_horizon - inference_delay` actions from the newly generated action chunk
+        # VLASH execution logic:
+        # - action_chunk: previously generated chunk, aligned to previous observation
+        # - next_action_chunk: newly generated chunk, aligned to current observation
+        # 
+        # With inference_delay=d and execute_horizon=h:
+        # - We execute first d actions from the *previous* chunk (these were pre-computed)
+        # - We execute the next (h-d) actions from the *new* chunk (actions 0 to h-d-1)
+        # - Total executed: d + (h-d) = h actions
+        #
+        # For next iteration:
+        # - Shift new chunk left by (h-d) to align with next observation point
+        # - The remaining actions become the prefix for the next iteration
+        
         action_chunk_to_execute = jnp.concatenate(
             [
                 action_chunk[:, : config.inference_delay],
@@ -114,8 +129,9 @@ def eval(
             ],
             axis=1,
         )
-        # throw away the first `execute_horizon` actions from the newly generated action chunk, to align it with the
-        # correct frame of reference for the next scan iteration
+        
+        # Shift the new action chunk for the next iteration
+        # We used actions [0, execute_horizon - inference_delay), so shift left by that amount
         next_action_chunk = jnp.concatenate(
             [
                 next_action_chunk[:, config.execute_horizon - config.inference_delay :],
@@ -124,23 +140,28 @@ def eval(
             axis=1,
         )
         next_n = jnp.concatenate([n[config.execute_horizon :], jnp.zeros(config.execute_horizon, dtype=jnp.int32)])
-        (rng, next_obs, next_env_state), (dones, env_states, infos) = jax.lax.scan(
-            step, (rng, obs, env_state), action_chunk_to_execute.transpose(1, 0, 2)
+        
+        # Execute actions and update action history through the step function
+        (rng, next_obs, next_env_state, next_action_history), (dones, env_states, infos) = jax.lax.scan(
+            step, (rng, obs, env_state, action_history), action_chunk_to_execute.transpose(1, 0, 2)
         )
-        # if config.inference_delay > 0:
-        #     infos["match"] = jnp.mean(jnp.abs(fixed_prefix - action_chunk_to_execute))
-        return (rng, next_obs, next_state, next_env_state, next_action_chunk, next_n), (dones, env_states, infos)
+        
+        return (rng, next_obs, next_action_history, next_env_state, next_action_chunk, next_n), (dones, env_states, infos)
 
     rng, key = jax.random.split(rng)
     obs, env_state = env.reset_to_level(key, level, env_params)
     rng, key = jax.random.split(rng)
-    state = jnp.zeros([obs.shape[0], policy.action_dim])
-    action_chunk = policy.action(key, jnp.concatenate([obs, state], axis=-1), config.num_flow_steps)  # [batch, horizon, action_dim]
+    
+    # Initialize action history with zeros
+    action_history = jnp.zeros([obs.shape[0], vlash_history_size, policy.action_dim])
+    
+    # Generate initial action chunk using vlash_action with zero history
+    action_chunk = policy.vlash_action(key, obs, config.num_flow_steps, action_history)  # [batch, horizon, action_dim]
     n = jnp.ones(action_chunk.shape[1], dtype=jnp.int32)
     scan_length = math.ceil(env_params.max_timesteps / config.execute_horizon)
     _, (dones, env_states, infos) = jax.lax.scan(
         execute_chunk,
-        (rng, obs, state, env_state, action_chunk, n),
+        (rng, obs, action_history, env_state, action_chunk, n),
         None,
         length=scan_length,
     )
@@ -208,6 +229,7 @@ def main(
         0
     ].shape[-1]
     action_dim = env.action_space(env_params).shape[0]
+    vlash_state_dim = get_vlash_state_dim(action_dim, config.model.vlash_order)
 
     mesh = jax.make_mesh((jax.local_device_count(),), ("x",))
     pspec = jax.sharding.PartitionSpec("x")
@@ -218,7 +240,7 @@ def main(
     @functools.partial(jax.vmap, in_axes=(None, 0, 0, 0, 0))
     def _eval(config: EvalConfig, rng: jax.Array, level: kenv_state.EnvState, state_dict, weak_state_dict):
         policy = _model.FlowPolicy(
-            obs_dim=obs_dim + action_dim,
+            obs_dim=obs_dim + vlash_state_dim,
             action_dim=action_dim,
             config=config.model,
             rngs=nnx.Rngs(rng),
