@@ -336,6 +336,113 @@ class FlowPolicy(nnx.Module):
         (x_1, _), _ = jax.lax.scan(step, (noise, 0.0), length=num_steps)
         assert x_1.shape == (obs.shape[0], self.action_chunk_size, self.action_dim), x_1.shape
         return x_1
+    
+    def fld_action(
+        self,
+        rng: jax.Array,
+        obs: jax.Array,
+        num_steps: int,
+        prev_action_chunk: jax.Array,   # [batch, horizon, action_dim]
+        inference_delay: int,
+        prefix_attention_horizon: int,
+        prefix_attention_schedule: PrefixAttentionSchedule,
+        # --- FLD hyperparameters ---
+        fld_k: int = 5,                 # inner Langevin iterations per denoising step (2–10)
+        fld_lam: float = 8.0,           # drift strength toward prev_action_chunk (6–10)
+        fld_eta: float = 0.1,           # Langevin step size (0.1–0.3)
+        fld_beta: float = 1.0,          # noise scale ratio: free region / prefix region
+    ) -> jax.Array:
+        """
+        Real-time action generation using Fast Langevin Dynamics (FLD).
+ 
+        Args:
+            rng:                       JAX random key
+            obs:                       Observations  [B, obs_dim]
+            num_steps:                 Number of flow (ODE) steps
+            prev_action_chunk:         Previously executed actions  [B, H, action_dim]
+            inference_delay:           How many leading actions are "known" (prefix)
+            prefix_attention_horizon:  Where attention to prefix decays to zero
+            prefix_attention_schedule: Shape of the attention decay curve
+            fld_k:    Inner Langevin iterations per outer step. More = better quality,
+                      slower. 2 is usually enough; use 5–10 for hard cases.
+            fld_lam:  How hard to pull x_t toward prev_action_chunk. Mirrors the
+                      content-alignment λ from LanPaint. Range 6–10.
+            fld_eta:  Langevin step size η. Too large → unstable; too small → slow
+                      mixing. Range 0.05–0.3.
+            fld_beta: Noise scale on the free region relative to the prefix region.
+                      1.0 = equal noise everywhere. Increase if fld_lam is high and
+                      the free region under-explores.
+ 
+        Returns:
+            x_1: Predicted action chunk  [B, action_chunk_size, action_dim]
+        """
+        dt = 1.0 / num_steps
+ 
+        # Precompute attention weights and free-region mask once (outside the scan).
+        # weights[h] ∈ [0, 1]: how strongly step h is anchored to prev_action_chunk.
+        # free_mask[h] = 1 for positions we are generating, 0 for the prefix.
+        weights = get_prefix_weights(
+            inference_delay, prefix_attention_horizon, self.action_chunk_size, prefix_attention_schedule
+        )                                                               # [H]
+        free_mask = (jnp.arange(self.action_chunk_size) >= inference_delay).astype(jnp.float32)  # [H]
+ 
+        # region_scale controls noise amplitude per timestep position:
+        #   prefix positions  → scale 1.0  (quieter; high weight anchors them)
+        #   free positions    → scale fld_beta  (louder; free to explore)
+        region_scale = free_mask * fld_beta + (1.0 - free_mask)        # [H]
+ 
+        def step(carry, rng_outer):
+            x_t, time = carry
+            # ── FLD guidance branch ─────────────────────────────────────────
+            # Inner loop: jax.lax.scan over fld_k Langevin steps.
+            # Each step uses a distinct rng split from rng_outer.
+            inner_rngs = jax.random.split(rng_outer, fld_k)        # [K, 2]
+
+            def fld_step(x_t_inner, rng_inner):
+                # (a) forward-only denoiser call — no vjp, no grad tape
+                v_t_inner = self(obs, x_t_inner, time)              # [B, H, D]
+
+                # (b) predict clean action via flow-matching equation:
+                #       x_1 = x_t + (1 − t) · v_t
+                x1_pred = x_t_inner + (1.0 - time) * v_t_inner     # [B, H, D]
+
+                # (c) drift: pull x1_pred toward prev_action_chunk in the
+                #     prefix region, smoothly weighted by the attention schedule.
+                #     weights[None, :, None] broadcasts over batch and action_dim.
+                inv_r2 = (time**2 + (1 - time)**2) / ((1 - time)**2 + 1e-8)
+                c = jnp.where(time < 1e-3, fld_lam, (1 - time) / (time + 1e-8))
+                lam_t = jnp.minimum(c * inv_r2, fld_lam)           # mirrors original schedule
+
+                drift = lam_t * (prev_action_chunk - x1_pred) * weights[None, :, None]
+
+
+                # (d) Langevin noise injection
+                noise = jax.random.normal(rng_inner, shape=x_t_inner.shape)
+                noise = noise * region_scale[None, :, None]
+
+                x_t_new = x_t_inner + fld_eta * drift + jnp.sqrt(2.0 * fld_eta) * noise
+                return x_t_new, None
+ 
+            x_t, _ = jax.lax.scan(fld_step, x_t, inner_rngs)      # [B, H, D]
+
+            # Final clean forward pass to get v_t for the outer ODE step.
+            # (The Langevin updates above moved x_t; this re-evaluates v_t
+            # at the improved position before committing the Euler step.)
+            v_t = self(obs, x_t, time)                              # [B, H, D]
+ 
+            return (x_t + dt * v_t, time + dt), None
+ 
+        noise = jax.random.normal(rng, shape=(obs.shape[0], self.action_chunk_size, self.action_dim))
+ 
+        # Split a distinct rng for every outer denoising step so that Langevin
+        # noise is independently sampled at each step without needing Python-side
+        # state inside the scan body.
+        step_rngs = jax.random.split(rng, num_steps)                    # [num_steps, 2]
+ 
+        (x_1, _), _ = jax.lax.scan(step, (noise, 0.0), step_rngs)
+        assert x_1.shape == (obs.shape[0], self.action_chunk_size, self.action_dim), x_1.shape
+        return x_1
+
 
     def te_action(
         self,
