@@ -48,6 +48,11 @@ class FLDMethodConfig:
 
 
 @dataclasses.dataclass(frozen=True)
+class RepaintingMethodConfig:
+    pass
+
+
+@dataclasses.dataclass(frozen=True)
 class TEMethodConfig:
     k: float = -0.015
     num_queries = 8
@@ -70,7 +75,7 @@ class EvalConfig:
 
     inference_delay: int = 0
     execute_horizon: int = 1
-    method: NaiveMethodConfig | RealtimeMethodConfig | FLDMethodConfig | TEMethodConfig | BIDMethodConfig = NaiveMethodConfig()
+    method: NaiveMethodConfig | RealtimeMethodConfig | FLDMethodConfig | RepaintingMethodConfig | TEMethodConfig | BIDMethodConfig = NaiveMethodConfig()
 
     model: _model.ModelConfig = _model.ModelConfig()
 
@@ -147,6 +152,22 @@ def eval(
                 fld_lam=config.method.fld_lam,
                 fld_eta=config.method.fld_eta,
                 # fld_beta=config.method.fld_beta,
+            )
+        elif isinstance(config.method, RepaintingMethodConfig):
+            prefix_attention_horizon = policy.action_chunk_size - config.execute_horizon
+            assert (
+                config.inference_delay <= policy.action_chunk_size
+                and prefix_attention_horizon <= policy.action_chunk_size
+            ), f"{config.inference_delay=} {prefix_attention_horizon=} {policy.action_chunk_size=}"
+            print(
+                f"[Repainting] {config.execute_horizon=} {config.inference_delay=} {prefix_attention_horizon=} {policy.action_chunk_size=}"
+            )
+            next_action_chunk = policy.repainting_action(
+                key,
+                obs,
+                config.num_flow_steps,
+                action_chunk,
+                config.inference_delay
             )
         elif isinstance(config.method, BIDMethodConfig):
             prefix_attention_horizon = policy.action_chunk_size - config.execute_horizon
@@ -310,59 +331,71 @@ def main(
     for inference_delay in [0, 1, 2, 3, 4]:
         for execute_horizon in range(max(1, inference_delay), 8 - inference_delay + 1):
             print(f"{inference_delay=} {execute_horizon=}")
-            for fld_k, fld_lam, fld_eta, fld_beta, suffix in fld_configs:
-                c = dataclasses.replace(
-                    config, inference_delay=inference_delay, execute_horizon=execute_horizon,
-                    method=FLDMethodConfig(
-                        fld_k=fld_k,
-                        fld_lam=fld_lam,
-                        fld_eta=fld_eta,
-                        fld_beta=fld_beta,
-                    )
-                )
-                out = jax.device_get(_eval(c, rngs, levels, state_dicts, weak_state_dicts))
-                for i in range(len(level_paths)):
-                    for k, v in out.items():
-                        results[k].append(v[i])
-                    results["delay"].append(inference_delay)
-                    results["method"].append(f"fld{suffix}")
-                    results["level"].append(level_paths[i])
-                    results["execute_horizon"].append(execute_horizon)
+            # for fld_k, fld_lam, fld_eta, fld_beta, suffix in fld_configs:
+            #     c = dataclasses.replace(
+            #         config, inference_delay=inference_delay, execute_horizon=execute_horizon,
+            #         method=FLDMethodConfig(
+            #             fld_k=fld_k,
+            #             fld_lam=fld_lam,
+            #             fld_eta=fld_eta,
+            #             fld_beta=fld_beta,
+            #         )
+            #     )
+            #     out = jax.device_get(_eval(c, rngs, levels, state_dicts, weak_state_dicts))
+            #     for i in range(len(level_paths)):
+            #         for k, v in out.items():
+            #             results[k].append(v[i])
+            #         results["delay"].append(inference_delay)
+            #         results["method"].append(f"fld{suffix}")
+            #         results["level"].append(level_paths[i])
+            #         results["execute_horizon"].append(execute_horizon)
                     
-            if inference_delay == 0 and execute_horizon == 1:
-                c = dataclasses.replace(
-                    config, inference_delay=inference_delay, execute_horizon=execute_horizon, method=TEMethodConfig()
-                )
-                out = jax.device_get(_eval(c, rngs, levels, state_dicts, weak_state_dicts))
-                for i in range(len(level_paths)):
-                    for k, v in out.items():
-                        results[k].append(v[i])
-                    results["delay"].append(inference_delay)
-                    results["method"].append("te")
-                    results["level"].append(level_paths[i])
-                    results["execute_horizon"].append(execute_horizon)
+            # if inference_delay == 0 and execute_horizon == 1:
+            #     c = dataclasses.replace(
+            #         config, inference_delay=inference_delay, execute_horizon=execute_horizon, method=TEMethodConfig()
+            #     )
+            #     out = jax.device_get(_eval(c, rngs, levels, state_dicts, weak_state_dicts))
+            #     for i in range(len(level_paths)):
+            #         for k, v in out.items():
+            #             results[k].append(v[i])
+            #         results["delay"].append(inference_delay)
+            #         results["method"].append("te")
+            #         results["level"].append(level_paths[i])
+            #         results["execute_horizon"].append(execute_horizon)
                     
-            c = dataclasses.replace(
-                config, inference_delay=inference_delay, execute_horizon=execute_horizon, method=NaiveMethodConfig()
-            )
-            out = jax.device_get(_eval(c, rngs, levels, state_dicts, weak_state_dicts))
-            for i in range(len(level_paths)):
-                for k, v in out.items():
-                    results[k].append(v[i])
-                results["delay"].append(inference_delay)
-                results["method"].append("naive")
-                results["level"].append(level_paths[i])
-                results["execute_horizon"].append(execute_horizon)
+            # c = dataclasses.replace(
+            #     config, inference_delay=inference_delay, execute_horizon=execute_horizon, method=NaiveMethodConfig()
+            # )
+            # out = jax.device_get(_eval(c, rngs, levels, state_dicts, weak_state_dicts))
+            # for i in range(len(level_paths)):
+            #     for k, v in out.items():
+            #         results[k].append(v[i])
+            #     results["delay"].append(inference_delay)
+            #     results["method"].append("naive")
+            #     results["level"].append(level_paths[i])
+            #     results["execute_horizon"].append(execute_horizon)
+
+            # c = dataclasses.replace(
+            #     config, inference_delay=inference_delay, execute_horizon=execute_horizon, method=RealtimeMethodConfig()
+            # )
+            # out = jax.device_get(_eval(c, rngs, levels, state_dicts, weak_state_dicts))
+            # for i in range(len(level_paths)):
+            #     for k, v in out.items():
+            #         results[k].append(v[i])
+            #     results["delay"].append(inference_delay)
+            #     results["method"].append("realtime")
+            #     results["level"].append(level_paths[i])
+            #     results["execute_horizon"].append(execute_horizon)
 
             c = dataclasses.replace(
-                config, inference_delay=inference_delay, execute_horizon=execute_horizon, method=RealtimeMethodConfig()
+                config, inference_delay=inference_delay, execute_horizon=execute_horizon, method=RepaintingMethodConfig()
             )
             out = jax.device_get(_eval(c, rngs, levels, state_dicts, weak_state_dicts))
             for i in range(len(level_paths)):
                 for k, v in out.items():
                     results[k].append(v[i])
                 results["delay"].append(inference_delay)
-                results["method"].append("realtime")
+                results["method"].append("repainting")
                 results["level"].append(level_paths[i])
                 results["execute_horizon"].append(execute_horizon)
 
@@ -378,20 +411,20 @@ def main(
             #     results["level"].append(level_paths[i])
             #     results["execute_horizon"].append(execute_horizon)
 
-            c = dataclasses.replace(
-                config,
-                inference_delay=inference_delay,
-                execute_horizon=execute_horizon,
-                method=RealtimeMethodConfig(prefix_attention_schedule="zeros"),
-            )
-            out = jax.device_get(_eval(c, rngs, levels, state_dicts, weak_state_dicts))
-            for i in range(len(level_paths)):
-                for k, v in out.items():
-                    results[k].append(v[i])
-                results["delay"].append(inference_delay)
-                results["method"].append("hard_masking")
-                results["level"].append(level_paths[i])
-                results["execute_horizon"].append(execute_horizon)
+            # c = dataclasses.replace(
+            #     config,
+            #     inference_delay=inference_delay,
+            #     execute_horizon=execute_horizon,
+            #     method=RealtimeMethodConfig(prefix_attention_schedule="zeros"),
+            # )
+            # out = jax.device_get(_eval(c, rngs, levels, state_dicts, weak_state_dicts))
+            # for i in range(len(level_paths)):
+            #     for k, v in out.items():
+            #         results[k].append(v[i])
+            #     results["delay"].append(inference_delay)
+            #     results["method"].append("hard_masking")
+            #     results["level"].append(level_paths[i])
+            #     results["execute_horizon"].append(execute_horizon)
     pathlib.Path(output_dir).mkdir(parents=True, exist_ok=True)
     df = pd.DataFrame(results)
     df.to_csv(pathlib.Path(output_dir) / "results.csv", index=False)
