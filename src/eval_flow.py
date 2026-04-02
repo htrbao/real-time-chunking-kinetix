@@ -211,8 +211,8 @@ def eval(
         (rng, next_obs, next_env_state), (dones, env_states, infos) = jax.lax.scan(
             step, (rng, obs, env_state), action_chunk_to_execute.transpose(1, 0, 2)
         )
-        # if config.inference_delay > 0:
-        #     infos["match"] = jnp.mean(jnp.abs(fixed_prefix - action_chunk_to_execute))
+        if config.inference_delay > 0:
+            infos["match"] = jnp.mean(jnp.abs(next_action_chunk - action_chunk_to_execute))
         return (rng, next_obs, next_env_state, next_action_chunk, next_n), (dones, env_states, infos)
 
     rng, key = jax.random.split(rng)
