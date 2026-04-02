@@ -33,6 +33,21 @@ class RealtimeMethodConfig:
 
 
 @dataclasses.dataclass(frozen=True)
+class FLDMethodConfig:
+    """Fast Langevin Dynamics — training-free replacement for gradient-based guidance.
+ 
+    Mirrors the RealtimeMethodConfig signature so it can be swapped in directly.
+    The prefix_attention_schedule controls the soft boundary weighting (same as
+    realtime_action). The four fld_* parameters control the inner Langevin loop.
+    """
+    prefix_attention_schedule: _model.PrefixAttentionSchedule = "exp"
+    fld_k: int = 5
+    fld_lam: float = 8.0
+    fld_eta: float = 0.1
+    fld_beta: float = 1.0
+
+
+@dataclasses.dataclass(frozen=True)
 class TEMethodConfig:
     k: float = -0.015
     num_queries = 8
@@ -55,7 +70,7 @@ class EvalConfig:
 
     inference_delay: int = 0
     execute_horizon: int = 1
-    method: NaiveMethodConfig | RealtimeMethodConfig | TEMethodConfig | BIDMethodConfig = NaiveMethodConfig()
+    method: NaiveMethodConfig | RealtimeMethodConfig | FLDMethodConfig | TEMethodConfig | BIDMethodConfig = NaiveMethodConfig()
 
     model: _model.ModelConfig = _model.ModelConfig()
 
@@ -105,6 +120,33 @@ def eval(
                 prefix_attention_horizon,
                 config.method.prefix_attention_schedule,
                 config.method.max_guidance_weight,
+            )
+        elif isinstance(config.method, FLDMethodConfig):
+            # FLD: training-free Langevin replacement for gradient-based guidance.
+            # Same prefix/horizon setup as RealtimeMethodConfig; no backprop needed.
+            prefix_attention_horizon = policy.action_chunk_size - config.execute_horizon
+            assert (
+                config.inference_delay <= policy.action_chunk_size
+                and prefix_attention_horizon <= policy.action_chunk_size
+            ), f"{config.inference_delay=} {prefix_attention_horizon=} {policy.action_chunk_size=}"
+            print(
+                f"[FLD] {config.execute_horizon=} {config.inference_delay=} "
+                f"{prefix_attention_horizon=} {policy.action_chunk_size=} "
+                f"K={config.method.fld_k} lam={config.method.fld_lam} "
+                f"eta={config.method.fld_eta} beta={config.method.fld_beta}"
+            )
+            next_action_chunk = policy.fld_action(
+                key,
+                obs,
+                config.num_flow_steps,
+                action_chunk,
+                config.inference_delay,
+                prefix_attention_horizon,
+                config.method.prefix_attention_schedule,
+                fld_k=config.method.fld_k,
+                fld_lam=config.method.fld_lam,
+                fld_eta=config.method.fld_eta,
+                # fld_beta=config.method.fld_beta,
             )
         elif isinstance(config.method, BIDMethodConfig):
             prefix_attention_horizon = policy.action_chunk_size - config.execute_horizon
@@ -182,18 +224,18 @@ def main(
     run_path: str,
     config: EvalConfig = EvalConfig(),
     level_paths: Sequence[str] = (
-        # "worlds/l/grasp_easy.json",
-        # "worlds/l/catapult.json",
-        # "worlds/l/cartpole_thrust.json",
+        "worlds/l/grasp_easy.json",
+        "worlds/l/catapult.json",
+        "worlds/l/cartpole_thrust.json",
         "worlds/l/hard_lunar_lander.json",
         "worlds/l/mjc_half_cheetah.json",
-        # "worlds/l/mjc_swimmer.json",
-        # "worlds/l/mjc_walker.json",
+        "worlds/l/mjc_swimmer.json",
+        "worlds/l/mjc_walker.json",
         "worlds/l/h17_unicycle.json",
-        # "worlds/l/chain_lander.json",
-        # "worlds/l/catcher_v3.json",
-        # "worlds/l/trampoline.json",
-        # "worlds/l/car_launch.json",
+        "worlds/l/chain_lander.json",
+        "worlds/l/catcher_v3.json",
+        "worlds/l/trampoline.json",
+        "worlds/l/car_launch.json",
     ),
     seed: int = 0,
     output_dir: str | None = "eval_output",
@@ -257,9 +299,36 @@ def main(
 
     rngs = jax.random.split(jax.random.key(seed), len(level_paths))
     results = collections.defaultdict(list)
+
+    fld_configs = [
+        (5,  8.0, 0.1, 1.0, ""),           # default, labelled "fld"
+        (2,  8.0, 0.1, 1.0, "_k2"),        # faster, fewer inner steps
+        (5, 10.0, 0.1, 1.0, "_lam10"),     # stronger prefix pull
+        (5,  8.0, 0.2, 1.0, "_eta02"),     # larger step size
+    ]
+
     for inference_delay in [0, 1, 2, 3, 4]:
         for execute_horizon in range(max(1, inference_delay), 8 - inference_delay + 1):
             print(f"{inference_delay=} {execute_horizon=}")
+            for fld_k, fld_lam, fld_eta, fld_beta, suffix in fld_configs:
+                c = dataclasses.replace(
+                    config, inference_delay=inference_delay, execute_horizon=execute_horizon,
+                    method=FLDMethodConfig(
+                        fld_k=fld_k,
+                        fld_lam=fld_lam,
+                        fld_eta=fld_eta,
+                        fld_beta=fld_beta,
+                    )
+                )
+                out = jax.device_get(_eval(c, rngs, levels, state_dicts, weak_state_dicts))
+                for i in range(len(level_paths)):
+                    for k, v in out.items():
+                        results[k].append(v[i])
+                    results["delay"].append(inference_delay)
+                    results["method"].append(f"fld{suffix}")
+                    results["level"].append(level_paths[i])
+                    results["execute_horizon"].append(execute_horizon)
+                    
             if inference_delay == 0 and execute_horizon == 1:
                 c = dataclasses.replace(
                     config, inference_delay=inference_delay, execute_horizon=execute_horizon, method=TEMethodConfig()

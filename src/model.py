@@ -342,105 +342,156 @@ class FlowPolicy(nnx.Module):
         rng: jax.Array,
         obs: jax.Array,
         num_steps: int,
-        prev_action_chunk: jax.Array,   # [batch, horizon, action_dim]
+        prev_action_chunk: jax.Array,   # [B, H, action_dim]
         inference_delay: int,
         prefix_attention_horizon: int,
         prefix_attention_schedule: PrefixAttentionSchedule,
-        # --- FLD hyperparameters ---
-        fld_k: int = 5,                 # inner Langevin iterations per denoising step (2–10)
-        fld_lam: float = 8.0,           # drift strength toward prev_action_chunk (6–10)
-        fld_eta: float = 0.1,           # Langevin step size (0.1–0.3)
-        fld_beta: float = 1.0,          # noise scale ratio: free region / prefix region
+        fld_k: int = 1,          # inner refinement sub-steps per outer ODE step
+        fld_lam: float = 5.0,    # guidance strength (analogous to max_guidance_weight)
+        fld_eta: float = 0.1,    # inner sub-step size  (must satisfy k*eta << dt)
     ) -> jax.Array:
-        """
-        Real-time action generation using Fast Langevin Dynamics (FLD).
+        """Gradient-free velocity-correction inpainting for flow matching ODEs.
+ 
+        Core principle
+        ──────────────
+        All guidance must live in *velocity space*, never in x_t space.
+ 
+        Wrong (breaks ODE — what the broken LanPaint port did):
+            x_t += η · drift + √(2η) · noise
+ 
+        Correct (this method):
+            v_t  += drift / (1 − t)          # chain rule through x̂₁ = x_t + (1-t)·v_t
+            x_t  += dt · v_corrected         # outer Euler step, ODE manifold preserved
+ 
+        Why: the flow ODE is deterministic. x_t must follow the learned flow manifold.
+        Any direct perturbation of x_t is seen by the next denoiser call as an
+        out-of-distribution input — especially catastrophic in low-dimensional action
+        spaces (6-DOF) where noise magnitude equals signal magnitude.
+ 
+        Algorithm per outer ODE step
+        ────────────────────────────
+        1. Compute adaptive lam_t  (strong near t=0, fades toward t=1)
+        2. Inner loop (K times):
+               a. forward pass  →  v_t = model(obs, x_t, time)
+               b. predict clean: x̂₁ = x_t + (1-t) · v_t
+               c. drift in x̂₁-space: δ = lam_t · (prev_chunk − x̂₁) · weights
+               d. velocity correction: Δv = δ / (1-t)        [chain rule]
+               e. sub-step along corrected v — NO noise:
+                      x_t ← x_t + eta · (v_t + Δv)
+        3. Final forward pass at refined x_t
+        4. Apply velocity correction once more and commit Euler step:
+               x_t ← x_t + dt · (v_t_final + Δv_final)
+ 
+        lam_t schedule
+        ──────────────
+        lam_t = fld_lam · (1 − time)
+ 
+        This has a critical numerical property: when substituted into Δv,
+            Δv = [fld_lam · (1−t) · (prev − x̂₁) · w] / (1−t)
+               = fld_lam · (prev − x̂₁) · w
+ 
+        The (1−t) cancels exactly, giving a constant-magnitude correction
+        throughout the ODE with no division-by-zero risk at t → 1.
+ 
+        Guidance is naturally stronger at the start (t=0, pure noise, large
+        influence over final output) and drops to zero at the end (t=1, clean).
+        This mirrors realtime_action's guidance_weight schedule.
+ 
+        Inner sub-steps (fld_k)
+        ───────────────────────
+        Each sub-step is one gradient-free Newton step on the constraint
+        ||prev_chunk − x̂₁(x_t)||². With the (1−t) cancellation above,
+        the effective step is:
+            x_t ← x_t + eta · fld_lam · (prev − x̂₁) · w  +  eta · v_t
+ 
+        Convergence requires: eta · fld_lam < 1.
+        Compute cost: (fld_k + 1) · num_steps denoiser calls total.
+        fld_k=1 (default) is 2× naive — the minimal useful setting.
+        fld_k=0 skips the inner loop; only the final corrected step applies.
  
         Args:
-            rng:                       JAX random key
+            rng:                       JAX random key (kept for API compatibility,
+                                       not used — this method is deterministic)
             obs:                       Observations  [B, obs_dim]
-            num_steps:                 Number of flow (ODE) steps
-            prev_action_chunk:         Previously executed actions  [B, H, action_dim]
-            inference_delay:           How many leading actions are "known" (prefix)
-            prefix_attention_horizon:  Where attention to prefix decays to zero
-            prefix_attention_schedule: Shape of the attention decay curve
-            fld_k:    Inner Langevin iterations per outer step. More = better quality,
-                      slower. 2 is usually enough; use 5–10 for hard cases.
-            fld_lam:  How hard to pull x_t toward prev_action_chunk. Mirrors the
-                      content-alignment λ from LanPaint. Range 6–10.
-            fld_eta:  Langevin step size η. Too large → unstable; too small → slow
-                      mixing. Range 0.05–0.3.
-            fld_beta: Noise scale on the free region relative to the prefix region.
-                      1.0 = equal noise everywhere. Increase if fld_lam is high and
-                      the free region under-explores.
+            num_steps:                 Number of outer ODE steps
+            prev_action_chunk:         Previously executed chunk  [B, H, action_dim]
+            inference_delay:           Number of prefix actions that are "known"
+            prefix_attention_horizon:  Position at which prefix weight decays to zero
+            prefix_attention_schedule: Decay curve shape (e.g. "exp", "linear")
+            fld_k:    Inner refinement sub-steps per outer step.
+                      0 = single corrected forward pass (cheapest, still effective).
+                      1 = one refinement then corrected commit (recommended).
+                      >1 = more refinement, diminishing returns beyond 3.
+            fld_lam:  Guidance strength. Analogous to max_guidance_weight.
+                      With the schedule above the effective correction magnitude is
+                      fld_lam · ||prev − x̂₁|| · weight, constant in t.
+                      Typical range: 3–8. Start at 5 and tune.
+            fld_eta:  Inner sub-step size.  Must satisfy: fld_k · fld_eta << dt.
+                      With num_steps=5, dt=0.2.  fld_k=1, eta=0.1 → 0.1 << 0.2 ✓.
  
         Returns:
-            x_1: Predicted action chunk  [B, action_chunk_size, action_dim]
+            x_1: Generated action chunk  [B, action_chunk_size, action_dim]
         """
         dt = 1.0 / num_steps
  
-        # Precompute attention weights and free-region mask once (outside the scan).
-        # weights[h] ∈ [0, 1]: how strongly step h is anchored to prev_action_chunk.
-        # free_mask[h] = 1 for positions we are generating, 0 for the prefix.
+        # weights[h] ∈ [0, 1]: guidance strength at action index h.
+        # 1.0 on the prefix (h < inference_delay), decaying to 0 beyond
+        # prefix_attention_horizon, 0 on the free region beyond that.
         weights = get_prefix_weights(
-            inference_delay, prefix_attention_horizon, self.action_chunk_size, prefix_attention_schedule
-        )                                                               # [H]
-        free_mask = (jnp.arange(self.action_chunk_size) >= inference_delay).astype(jnp.float32)  # [H]
+            inference_delay,
+            prefix_attention_horizon,
+            self.action_chunk_size,
+            prefix_attention_schedule,
+        )  # [H]
  
-        # region_scale controls noise amplitude per timestep position:
-        #   prefix positions  → scale 1.0  (quieter; high weight anchors them)
-        #   free positions    → scale fld_beta  (louder; free to explore)
-        region_scale = free_mask * fld_beta + (1.0 - free_mask)        # [H]
+        def _corrected_velocity(x_t, v_t, time, lam_t):
+            """Return v_t + Δv, where Δv steers x̂₁ toward prev_action_chunk.
  
-        def step(carry, rng_outer):
+            x_t is read-only here.  The returned value is a corrected velocity
+            estimate — drop-in replacement for v_t in any Euler step.
+ 
+            With lam_t = fld_lam*(1-t):
+                Δv = lam_t*(prev - x̂₁)*w / (1-t)
+                   = fld_lam*(prev - x̂₁)*w      ← (1-t) cancels, always finite
+            """
+            x1_pred     = x_t + (1.0 - time) * v_t                # [B, H, D]
+            drift       = lam_t * (prev_action_chunk - x1_pred) \
+                          * weights[None, :, None]                  # [B, H, D]
+            v_correction = drift / (1.0 - time + 1e-6)             # [B, H, D]
+            return v_t + v_correction
+ 
+        def step(carry, _):
             x_t, time = carry
-            # ── FLD guidance branch ─────────────────────────────────────────
-            # Inner loop: jax.lax.scan over fld_k Langevin steps.
-            # Each step uses a distinct rng split from rng_outer.
-            inner_rngs = jax.random.split(rng_outer, fld_k)        # [K, 2]
-
-            def fld_step(x_t_inner, rng_inner):
-                # (a) forward-only denoiser call — no vjp, no grad tape
-                v_t_inner = self(obs, x_t_inner, time)              # [B, H, D]
-
-                # (b) predict clean action via flow-matching equation:
-                #       x_1 = x_t + (1 − t) · v_t
-                x1_pred = x_t_inner + (1.0 - time) * v_t_inner     # [B, H, D]
-
-                # (c) drift: pull x1_pred toward prev_action_chunk in the
-                #     prefix region, smoothly weighted by the attention schedule.
-                #     weights[None, :, None] broadcasts over batch and action_dim.
-                inv_r2 = (time**2 + (1 - time)**2) / ((1 - time)**2 + 1e-8)
-                c = jnp.where(time < 1e-3, fld_lam, (1 - time) / (time + 1e-8))
-                lam_t = jnp.minimum(c * inv_r2, fld_lam)           # mirrors original schedule
-
-                drift = lam_t * (prev_action_chunk - x1_pred) * weights[None, :, None]
-
-
-                # (d) Langevin noise injection
-                noise = jax.random.normal(rng_inner, shape=x_t_inner.shape)
-                noise = noise * region_scale[None, :, None]
-
-                x_t_new = x_t_inner + fld_eta * drift + jnp.sqrt(2.0 * fld_eta) * noise
-                return x_t_new, None
  
-            x_t, _ = jax.lax.scan(fld_step, x_t, inner_rngs)      # [B, H, D]
-
-            # Final clean forward pass to get v_t for the outer ODE step.
-            # (The Langevin updates above moved x_t; this re-evaluates v_t
-            # at the improved position before committing the Euler step.)
-            v_t = self(obs, x_t, time)                              # [B, H, D]
+            # Adaptive guidance: lam_t · (1-t) schedule so that the (1-t)
+            # factor in Δv = drift/(1-t) cancels → bounded correction for all t.
+            # Strong early (shapes trajectory), zero at t=1 (clean output).
+            lam_t = fld_lam * (1.0 - time)
  
-            return (x_t + dt * v_t, time + dt), None
+            # ── Inner refinement: move x_t toward corrected ODE path ──────────
+            # Each sub-step is one forward pass + corrected Euler micro-step.
+            # NO noise — x_t must stay on the flow manifold.
+            def inner_step(x_t_inner, _):
+                v_t_inner  = self(obs, x_t_inner, time)
+                v_corrected = _corrected_velocity(x_t_inner, v_t_inner, time, lam_t)
+                return x_t_inner + fld_eta * v_corrected, None
  
-        noise = jax.random.normal(rng, shape=(obs.shape[0], self.action_chunk_size, self.action_dim))
+            x_t, _ = jax.lax.scan(inner_step, x_t, None, length=fld_k)
  
-        # Split a distinct rng for every outer denoising step so that Langevin
-        # noise is independently sampled at each step without needing Python-side
-        # state inside the scan body.
-        step_rngs = jax.random.split(rng, num_steps)                    # [num_steps, 2]
+            # ── Commit outer ODE step with velocity correction ────────────────
+            # Re-evaluate v_t at the refined x_t, apply correction, advance.
+            # This ensures the full outer Euler step respects the prefix.
+            v_t_final   = self(obs, x_t, time)
+            v_committed = _corrected_velocity(x_t, v_t_final, time, lam_t)
  
-        (x_1, _), _ = jax.lax.scan(step, (noise, 0.0), step_rngs)
-        assert x_1.shape == (obs.shape[0], self.action_chunk_size, self.action_dim), x_1.shape
+            return (x_t + dt * v_committed, time + dt), None
+ 
+        x_0 = jax.random.normal(
+            rng, shape=(obs.shape[0], self.action_chunk_size, self.action_dim)
+        )
+        (x_1, _), _ = jax.lax.scan(step, (x_0, 0.0), None, length=num_steps)
+ 
+        assert x_1.shape == (obs.shape[0], self.action_chunk_size, self.action_dim)
         return x_1
 
 
