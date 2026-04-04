@@ -540,12 +540,17 @@ class FlowPolicy(nnx.Module):
         # [:d] = prev_action_chunk[:d]   hard-set prefix
         # [d:] = x_1_naive[d:]           on-manifold free (needed for valid inversion)
  
-        # ── Step 3: backward — invert to find x_0_star ────────────────────────
-        (x_0_star, _), _ = jax.lax.scan(
-            backward_step, (x_1_target, 1.0 - dt), length=num_steps
-        )
-        # x_0_star[:d] ← the noise that denoises to prev_action_chunk[:d]  KEEP THIS
-        # x_0_star[d:] ← the noise that denoises to x_1_naive[d:]          DISCARD
+        # # ── Step 3: backward — invert to find x_0_star ──────────────────────── THIS IS EULER BACKWARD
+        # (x_0_star, _), _ = jax.lax.scan(
+        #     backward_step, (x_1_target, 1.0 - dt), length=num_steps
+        # )
+        # # x_0_star[:d] ← the noise that denoises to prev_action_chunk[:d]  KEEP THIS
+        # # x_0_star[d:] ← the noise that denoises to x_1_naive[d:]          DISCARD
+
+        # ── Step 3: backward — invert to find x_0_star ──────────────────────── THIS IS RFM BACKWARD
+        t_one    = jnp.ones((obs.shape[0],))
+        v_at_1   = self(obs, x_1_target, t_one)
+        x_0_star = x_1_target - v_at_1
  
         # ── Step 4: Mao re-painting — KEEP prefix noise, REPLACE free noise ──
         fresh_eps = jax.random.normal(
