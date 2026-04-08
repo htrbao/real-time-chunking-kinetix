@@ -49,7 +49,9 @@ class FLDMethodConfig:
 
 @dataclasses.dataclass(frozen=True)
 class RepaintingMethodConfig:
-    pass
+    inversion_method: _model.InversionMethod = "euler"
+    optim_iters: int = 5 # only used when inversion_method="optim"
+    optim_lr: float = 0.1
 
 
 @dataclasses.dataclass(frozen=True)
@@ -213,6 +215,8 @@ def eval(
         )
         if config.inference_delay > 0:
             infos["match"] = jnp.mean(jnp.abs(next_action_chunk - action_chunk_to_execute))
+        else:
+            infos["match"] = 0.0
         return (rng, next_obs, next_env_state, next_action_chunk, next_n), (dones, env_states, infos)
 
     rng, key = jax.random.split(rng)
@@ -347,6 +351,22 @@ def main(
                         results[k].append(v[i])
                     results["delay"].append(inference_delay)
                     results["method"].append(f"fld{suffix}")
+                    results["level"].append(level_paths[i])
+                    results["execute_horizon"].append(execute_horizon)
+
+            for inv_method in ["rfm", "euler", "dpm2", "optim"]:
+                c = dataclasses.replace(
+                    config, inference_delay=inference_delay, execute_horizon=execute_horizon,
+                    method=RepaintingMethodConfig(
+                        inversion_method=inv_method
+                    )
+                )
+                out = jax.device_get(_eval(c, rngs, levels, state_dicts, weak_state_dicts))
+                for i in range(len(level_paths)):
+                    for k, v in out.items():
+                        results[k].append(v[i])
+                    results["delay"].append(inference_delay)
+                    results["method"].append(f"repaint-{inv_method}")
                     results["level"].append(level_paths[i])
                     results["execute_horizon"].append(execute_horizon)
                     
