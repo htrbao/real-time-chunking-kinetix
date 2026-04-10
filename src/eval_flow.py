@@ -162,7 +162,7 @@ def eval(
                 and prefix_attention_horizon <= policy.action_chunk_size
             ), f"{config.inference_delay=} {prefix_attention_horizon=} {policy.action_chunk_size=}"
             print(
-                f"[Repainting] {config.execute_horizon=} {config.inference_delay=} {prefix_attention_horizon=} {policy.action_chunk_size=}"
+                f"[Repainting-{config.method.inversion_method}] {config.execute_horizon=} {config.inference_delay=} {prefix_attention_horizon=} {policy.action_chunk_size=}"
             )
             next_action_chunk = policy.repainting_action(
                 key,
@@ -200,6 +200,10 @@ def eval(
             ],
             axis=1,
         )
+        if config.inference_delay > 0:
+            infos["match"] = jnp.mean(jnp.abs(next_action_chunk[:, : config.inference_delay] - action_chunk[:, : config.inference_delay]))
+        else:
+            infos["match"] = jnp.array(0.0)
         # throw away the first `execute_horizon` actions from the newly generated action chunk, to align it with the
         # correct frame of reference for the next scan iteration
         next_action_chunk = jnp.concatenate(
@@ -213,10 +217,6 @@ def eval(
         (rng, next_obs, next_env_state), (dones, env_states, infos) = jax.lax.scan(
             step, (rng, obs, env_state), action_chunk_to_execute.transpose(1, 0, 2)
         )
-        if config.inference_delay > 0:
-            infos["match"] = jnp.mean(jnp.abs(next_action_chunk - action_chunk_to_execute))
-        else:
-            infos["match"] = 0.0
         return (rng, next_obs, next_env_state, next_action_chunk, next_n), (dones, env_states, infos)
 
     rng, key = jax.random.split(rng)
