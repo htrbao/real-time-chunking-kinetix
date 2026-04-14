@@ -554,7 +554,7 @@ class FlowPolicy(nnx.Module):
             x_0_star = self._invert_optimization(
                 obs, x_1_target, num_steps,
                 num_iters=optim_iters, lr=optim_lr,
-                init_method="rfm",   # warm-start from RFM
+                init_method="zeros",   # warm-start from RFM
             )
         else:
             raise ValueError(f"Unknown inversion_method: {inversion_method}")
