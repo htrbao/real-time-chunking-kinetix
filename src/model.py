@@ -501,6 +501,75 @@ class FlowPolicy(nnx.Module):
         obs: jax.Array,
         num_steps: int,
         prev_action_chunk: jax.Array,   # [B, H, action_dim]
+        inference_delay: int
+    ) -> jax.Array:
+        """
+        Real-time action generation via DDIM-inversion re-painting.
+
+        Adapts the re-painting idea from Mao et al. "Guided Image Synthesis via
+        Initial Image Editing in Diffusion Model" (MM'23) to flow matching action
+        chunks.
+
+        Core insight (Mao et al.)
+        """
+        dt = 1.0 / num_steps
+ 
+        def forward_step(carry, _):
+            x_t, time = carry
+            v_t = self(obs, x_t, time)
+            return (x_t + dt * v_t, time + dt), None
+ 
+        def backward_step(carry, _):
+            x_t, time = carry
+            v_t = self(obs, x_t, time)
+            return (x_t - dt * v_t, time - dt), None
+ 
+        # prefix_mask: True for positions [:d], False for [d:]
+        prefix_mask = (
+            jnp.arange(self.action_chunk_size)[None, :, None] < inference_delay
+        )  # [1, H, 1]
+ 
+        # ── Step 1: forward — get on-manifold x_1_naive for step 2 ───────────
+        rng, rng_free, rng_fresh = jax.random.split(rng, 3)
+        x_0_free = jax.random.normal(
+            rng_free, shape=(obs.shape[0], self.action_chunk_size, self.action_dim)
+        )
+        (x_1_naive, _), _ = jax.lax.scan(forward_step, (x_0_free, 0.0), length=num_steps)
+ 
+        # ── Step 2: construct target ───────────────────────────────────────────
+        x_1_target = jnp.where(prefix_mask, prev_action_chunk, x_1_naive)
+        # [:d] = prev_action_chunk[:d]   hard-set prefix
+        # [d:] = x_1_naive[d:]           on-manifold free (needed for valid inversion)
+ 
+        # # ── Step 3: backward — invert to find x_0_star ──────────────────────── THIS IS EULER BACKWARD
+        (x_0_star, _), _ = jax.lax.scan(
+            backward_step, (x_1_target, 1.0 - dt), length=num_steps
+        )
+        # # x_0_star[:d] ← the noise that denoises to prev_action_chunk[:d]  KEEP THIS
+        # # x_0_star[d:] ← the noise that denoises to x_1_naive[d:]          DISCARD
+ 
+        # ── Step 4: Mao re-painting — KEEP prefix noise, REPLACE free noise ──
+        fresh_eps = jax.random.normal(
+            rng_fresh, shape=(obs.shape[0], self.action_chunk_size, self.action_dim)
+        )
+        x_0_repaint = jnp.where(prefix_mask, x_0_star, x_0_free)
+        # [:d] = x_0_star[:d]   KEPT  — anchors output to prev_action_chunk[:d]
+        # [d:] = fresh_eps[d:]  REPLACED — model repaints from fresh Gaussian noise
+ 
+        # ── Step 5: forward from re-painted noise ─────────────────────────────
+        (x_1_final, _), _ = jax.lax.scan(forward_step, (x_0_repaint, 0.0), length=num_steps)
+        # x_1_final[:d] ≈ prev_action_chunk[:d]
+        # x_1_final[d:] ~ fresh model generation from obs
+ 
+        assert x_1_final.shape == (obs.shape[0], self.action_chunk_size, self.action_dim)
+        return x_1_final
+
+    def repainting_action_v2(
+        self,
+        rng: jax.Array,
+        obs: jax.Array,
+        num_steps: int,
+        prev_action_chunk: jax.Array,   # [B, H, action_dim]
         inference_delay: int,
         inversion_method: str = "rfm",  # "rfm" | "dpm2" | "euler" | "optim"
         optim_iters: int = 5,           # only used when inversion_method="optim"
