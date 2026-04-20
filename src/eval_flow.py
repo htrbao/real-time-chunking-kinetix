@@ -56,7 +56,12 @@ class RepaintingMethodConfig:
 class RepaintingMethodV2Config:
     inversion_method: _model.InversionMethod = "euler"
     optim_iters: int = 5 # only used when inversion_method="optim"
-    optim_lr: float = 0.1
+    optim_lr: float = 0.01
+
+
+@dataclasses.dataclass(frozen=True)
+class SNWMethodConfig:
+    pass
 
 
 @dataclasses.dataclass(frozen=True)
@@ -192,6 +197,22 @@ def eval(
                 action_chunk,
                 config.inference_delay,
                 config.method.inversion_method
+            )
+        elif isinstance(config.method, SNWMethodConfig):
+            prefix_attention_horizon = policy.action_chunk_size - config.execute_horizon
+            assert (
+                config.inference_delay <= policy.action_chunk_size
+                and prefix_attention_horizon <= policy.action_chunk_size
+            ), f"{config.inference_delay=} {prefix_attention_horizon=} {policy.action_chunk_size=}"
+            print(
+                f"[SNW] {config.execute_horizon=} {config.inference_delay=} {prefix_attention_horizon=} {policy.action_chunk_size=}"
+            )
+            next_action_chunk = policy.snw_action(
+                key,
+                obs,
+                config.num_flow_steps,
+                action_chunk,
+                config.inference_delay
             )
         elif isinstance(config.method, BIDMethodConfig):
             prefix_attention_horizon = policy.action_chunk_size - config.execute_horizon
@@ -405,6 +426,18 @@ def main(
                     results["method"].append(f"repaintv2-{inv_method}")
                     results["level"].append(level_paths[i])
                     results["execute_horizon"].append(execute_horizon)
+
+            c = dataclasses.replace(
+                config, inference_delay=inference_delay, execute_horizon=execute_horizon, method=SNWMethodConfig()
+            )
+            out = jax.device_get(_eval(c, rngs, levels, state_dicts, weak_state_dicts))
+            for i in range(len(level_paths)):
+                for k, v in out.items():
+                    results[k].append(v[i])
+                results["delay"].append(inference_delay)
+                results["method"].append("snw")
+                results["level"].append(level_paths[i])
+                results["execute_horizon"].append(execute_horizon)
                     
             if inference_delay == 0 and execute_horizon == 1:
                 c = dataclasses.replace(

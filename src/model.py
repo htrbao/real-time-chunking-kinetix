@@ -183,6 +183,7 @@ class FlowPolicy(nnx.Module):
         self.vlash_order = config.vlash_order
         self.ensembled_actions = None
         self.ensembled_actions_count = None
+        self.snw_stored_noise: jax.Array | None = None
 
         self.in_proj = nnx.Linear(action_dim + obs_dim, config.channel_dim, rngs=rngs)
         self.mlp_stack = [
@@ -210,6 +211,7 @@ class FlowPolicy(nnx.Module):
     def reset(self):
         self.ensembled_actions = None
         self.ensembled_actions_count = None
+        self.snw_stored_noise = None
 
     def __call__(self, obs: jax.Array, x_t: jax.Array, time: jax.Array) -> jax.Array:
         assert x_t.shape == (obs.shape[0], self.action_chunk_size, self.action_dim), x_t.shape
@@ -634,6 +636,76 @@ class FlowPolicy(nnx.Module):
  
         assert x_1_final.shape == (obs.shape[0], self.action_chunk_size, self.action_dim)
         return x_1_final
+    
+    def snw_action(
+        self,
+        rng: jax.Array,
+        obs: jax.Array,
+        num_steps: int,
+        prev_action_chunk: jax.Array,   # [B, H, action_dim]
+        inference_delay: int,
+    ) -> jax.Array:
+        dt = 1.0 / num_steps
+        B, H, D = obs.shape[0], self.action_chunk_size, self.action_dim
+        d = inference_delay
+ 
+        # True for positions [:d], False for [d:]
+        prefix_mask = (
+            jnp.arange(H)[None, :, None] < d
+        )  # [1, H, 1]
+ 
+        # ── shared helpers ────────────────────────────────────────────────────
+ 
+        def forward_ode(x_0: jax.Array) -> jax.Array:
+            """Standard forward ODE: x_0 → x_1.  [N model calls]"""
+            def step(carry, _):
+                x_t, time = carry
+                v_t = self(obs, x_t, time)
+                return (x_t + dt * v_t, time + dt), None
+            (x_1, _), _ = jax.lax.scan(step, (x_0, 0.0), length=num_steps)
+            return x_1
+ 
+        def backward_euler(x_1_tgt: jax.Array) -> jax.Array:
+            """Backward Euler inversion: x_1_target → x_0^*.  [N model calls]"""
+            def step(carry, _):
+                x_t, time = carry
+                v_t = self(obs, x_t, time)
+                return (x_t - dt * v_t, time - dt), None
+            (x_0_star, _), _ = jax.lax.scan(
+                step, (x_1_tgt, 1.0 - dt), length=num_steps
+            )
+            return x_0_star
+ 
+        if self.snw_stored_noise is None:
+            rng, rng_free = jax.random.split(rng)
+            x_0_free = jax.random.normal(rng_free, shape=(B, H, D))
+            x_1_naive = forward_ode(x_0_free)
+            x_1_target = jnp.where(prefix_mask, prev_action_chunk, x_1_naive)
+            x_0_star = backward_euler(x_1_target)
+            x_0_repaint = jnp.where(prefix_mask, x_0_star, x_0_free)
+            x_1_final = forward_ode(x_0_repaint)
+ 
+            self.snw_stored_noise = x_0_repaint
+ 
+        else:
+            rng, rng_fresh = jax.random.split(rng)
+            fresh_eps = jax.random.normal(rng_fresh, shape=(B, H, D))
+ 
+            x_0_slide = jnp.where(
+                prefix_mask,
+                self.snw_stored_noise,   # [:d]: REUSED prefix anchor
+                fresh_eps,               # [d:]: fresh — model repaints freely
+            )
+ 
+            # Single forward pass — same cost as naive action()
+            x_1_final = forward_ode(x_0_slide)                  # [N calls]
+ 
+            # Update stored noise — prefix noise unchanged, free updated
+            self.snw_stored_noise = x_0_slide
+ 
+        assert x_1_final.shape == (B, H, D)
+        return x_1_final
+
 
     def te_action(
         self,
